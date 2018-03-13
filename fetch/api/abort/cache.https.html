@@ -29,7 +29,7 @@
 
     const data = await fetch(cachedRequest).then(r => r.json());
     assert_equals(data.key, 'value', 'Fetch fully completes');
-  }, "Signals are not stored in the cache API");
+  }, "Signals are not stored in the cache API 111");
 
   promise_test(async () => {
     await caches.delete('test');
