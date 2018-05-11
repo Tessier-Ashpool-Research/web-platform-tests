@@ -5,8 +5,8 @@ from __future__ import print_function
 import abc
 import argparse
 import json
+import logging
 import os
-import re
 import socket
 import sys
 import threading
@@ -18,16 +18,17 @@ from collections import defaultdict, OrderedDict
 from multiprocessing import Process, Event
 
 from localpaths import repo_root
+from six.moves import reload_module
 
-import sslutils
-from manifest.sourcefile import read_script_metadata, js_meta_re
+from manifest.sourcefile import read_script_metadata, js_meta_re, parse_variants
 from wptserve import server as wptserve, handlers
 from wptserve import stash
 from wptserve import config
 from wptserve.logger import set_logger
 from wptserve.handlers import filesystem_path, wrap_pipeline
-from wptserve.utils import get_port
+from wptserve.utils import get_port, HTTPException
 from mod_pywebsocket import standalone as pywebsocket
+
 
 def replace_end(s, old, new):
     """
@@ -56,9 +57,14 @@ class WrapperHandler(object):
         for header_name, header_value in self.headers:
             response.headers.set(header_name, header_value)
 
+        self.check_exposure(request)
+
         path = self._get_path(request.url_parts.path, True)
+        query = request.url_parts.query
+        if query:
+            query = "?" + query
         meta = "\n".join(self._get_meta(request))
-        response.content = self.wrapper % {"meta": meta, "path": path}
+        response.content = self.wrapper % {"meta": meta, "path": path, "query": query}
         wrap_pipeline(path, request, response)
 
     def _get_path(self, path, resource_path):
@@ -85,18 +91,27 @@ class WrapperHandler(object):
                 path = replace_end(path, src, dest)
         return path
 
-    def _get_meta(self, request):
-        """Get an iterator over strings to inject into the wrapper document
-        based on //META comments in the associated js file.
+    def _get_metadata(self, request):
+        """Get an iterator over script metadata based on //META comments in the
+        associated js file.
 
         :param request: The Request being processed.
         """
         path = self._get_path(filesystem_path(self.base_path, request, self.url_base), False)
         with open(path, "rb") as f:
             for key, value in read_script_metadata(f, js_meta_re):
-                replacement = self._meta_replacement(key, value)
-                if replacement:
-                    yield replacement
+                yield key, value
+
+    def _get_meta(self, request):
+        """Get an iterator over strings to inject into the wrapper document
+        based on //META comments in the associated js file.
+
+        :param request: The Request being processed.
+        """
+        for key, value in self._get_metadata(request):
+            replacement = self._meta_replacement(key, value)
+            if replacement:
+                yield replacement
 
     @abc.abstractproperty
     def path_replace(self):
@@ -118,8 +133,27 @@ class WrapperHandler(object):
         # a specific metadata key: value pair.
         pass
 
+    @abc.abstractmethod
+    def check_exposure(self, request):
+        # Raise an exception if this handler shouldn't be exposed after all.
+        pass
+
 
 class HtmlWrapperHandler(WrapperHandler):
+    global_type = None
+
+    def check_exposure(self, request):
+        if self.global_type:
+            globals = b""
+            for (key, value) in self._get_metadata(request):
+                if key == b"global":
+                    globals = value
+                    break
+
+            if self.global_type not in parse_variants(globals):
+                raise HTTPException(404, "This test cannot be loaded in %s mode" %
+                                    self.global_type)
+
     def _meta_replacement(self, key, value):
         if key == b"timeout":
             if value == b"long":
@@ -131,6 +165,7 @@ class HtmlWrapperHandler(WrapperHandler):
 
 
 class WorkersHandler(HtmlWrapperHandler):
+    global_type = b"dedicatedworker"
     path_replace = [(".any.worker.html", ".any.js", ".any.worker.js"),
                     (".worker.html", ".worker.js")]
     wrapper = """<!doctype html>
@@ -140,7 +175,7 @@ class WorkersHandler(HtmlWrapperHandler):
 <script src="/resources/testharnessreport.js"></script>
 <div id=log></div>
 <script>
-fetch_tests_from_worker(new Worker("%(path)s"));
+fetch_tests_from_worker(new Worker("%(path)s%(query)s"));
 </script>
 """
 
@@ -158,6 +193,7 @@ class WindowHandler(HtmlWrapperHandler):
 
 
 class AnyHtmlHandler(HtmlWrapperHandler):
+    global_type = b"window"
     path_replace = [(".any.html", ".any.js")]
     wrapper = """<!doctype html>
 <meta charset=utf-8>
@@ -175,6 +211,42 @@ self.GLOBAL = {
 """
 
 
+class SharedWorkersHandler(HtmlWrapperHandler):
+    global_type = b"sharedworker"
+    path_replace = [(".any.sharedworker.html", ".any.js", ".any.worker.js")]
+    wrapper = """<!doctype html>
+<meta charset=utf-8>
+%(meta)s
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<div id=log></div>
+<script>
+fetch_tests_from_worker(new SharedWorker("%(path)s%(query)s"));
+</script>
+"""
+
+
+class ServiceWorkersHandler(HtmlWrapperHandler):
+    global_type = b"serviceworker"
+    path_replace = [(".https.any.serviceworker.html", ".any.js", ".any.worker.js")]
+    wrapper = """<!doctype html>
+<meta charset=utf-8>
+%(meta)s
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<div id=log></div>
+<script>
+(async function() {
+  const scope = 'does/not/exist';
+  let reg = await navigator.serviceWorker.getRegistration(scope);
+  if (reg) await reg.unregister();
+  reg = await navigator.serviceWorker.register("%(path)s%(query)s", {scope});
+  fetch_tests_from_worker(reg.installing);
+})();
+</script>
+"""
+
+
 class AnyWorkerHandler(WrapperHandler):
     headers = [('Content-Type', 'text/javascript')]
     path_replace = [(".any.worker.js", ".any.js")]
@@ -189,8 +261,6 @@ done();
 """
 
     def _meta_replacement(self, key, value):
-        if key == b"timeout":
-            return None
         if key == b"script":
             attribute = value.decode('utf-8').replace("\\", "\\\\").replace('"', '\\"')
             return 'importScripts("%s")' % attribute
@@ -243,6 +313,8 @@ class RoutesBuilder(object):
             ("GET", "*.worker.html", WorkersHandler),
             ("GET", "*.window.html", WindowHandler),
             ("GET", "*.any.html", AnyHtmlHandler),
+            ("GET", "*.any.sharedworker.html", SharedWorkersHandler),
+            ("GET", "*.https.any.serviceworker.html", ServiceWorkersHandler),
             ("GET", "*.any.worker.js", AnyWorkerHandler),
             ("GET", "*.asis", handlers.AsIsHandler),
             ("*", "*.py", handlers.PythonScriptHandler),
@@ -327,9 +399,13 @@ class ServerProc(object):
         return self.proc.is_alive()
 
 
-def check_subdomains(domains, paths, bind_address, ssl_config, aliases):
-    domains = domains.copy()
-    host = domains.pop("")
+def check_subdomains(config):
+    paths = config.paths
+    bind_address = config.bind_address
+    ssl_config = config.ssl_config
+    aliases = config.aliases
+
+    host = config.server_host
     port = get_port(host)
     logger.debug("Going to use port %d to check subdomains" % port)
 
@@ -351,7 +427,10 @@ def check_subdomains(domains, paths, bind_address, ssl_config, aliases):
                         "You may need to edit /etc/hosts or similar, see README.md." % (host, port))
         sys.exit(1)
 
-    for domain in domains.itervalues():
+    for domain in config.domains_set:
+        if domain == host:
+            continue
+
         try:
             urllib2.urlopen("http://%s:%d/" % (domain, port))
         except Exception as e:
@@ -365,10 +444,10 @@ def check_subdomains(domains, paths, bind_address, ssl_config, aliases):
 def make_hosts_file(config, host):
     rv = []
 
-    for domain in config["domains"].values():
+    for domain in config.domains_set:
         rv.append("%s\t%s\n" % (host, domain))
 
-    for not_domain in config.get("not_domains", {}).values():
+    for not_domain in config.not_domains_set:
         rv.append("0.0.0.0\t%s\n" % not_domain)
 
     return "".join(rv)
@@ -494,6 +573,9 @@ class WebSocketDaemon(object):
 
 def start_ws_server(host, port, paths, routes, bind_address, config, ssl_config,
                     **kwargs):
+    # Ensure that when we start this in a new process we don't inherit the
+    # global lock in the logging module
+    reload_module(logging)
     return WebSocketDaemon(host,
                            str(port),
                            repo_root,
@@ -505,6 +587,9 @@ def start_ws_server(host, port, paths, routes, bind_address, config, ssl_config,
 
 def start_wss_server(host, port, paths, routes, bind_address, config, ssl_config,
                      **kwargs):
+    # Ensure that when we start this in a new process we don't inherit the
+    # global lock in the logging module
+    reload_module(logging)
     return WebSocketDaemon(host,
                            str(port),
                            repo_root,
@@ -535,16 +620,10 @@ def iter_procs(servers):
             yield server.proc
 
 
-def load_config(default_path, override_path=None, **kwargs):
-    if os.path.exists(default_path):
-        with open(default_path) as f:
-            base_obj = json.load(f)
-    else:
-        raise ValueError("Config path %s does not exist" % default_path)
+def load_config(override_path=None, **kwargs):
+    rv = Config()
 
-    rv = Config(**base_obj)
-
-    if os.path.exists(override_path):
+    if override_path and os.path.exists(override_path):
         with open(override_path) as f:
             override_obj = json.load(f)
         rv.update(override_obj)
@@ -579,10 +658,47 @@ _subdomains = {u"www",
 
 _not_subdomains = {u"nonexistent-origin"}
 
+
 class Config(config.Config):
     """serve config
 
     this subclasses wptserve.config.Config to add serve config options"""
+
+    _default = {
+        "browser_host": "web-platform.test",
+        "alternate_hosts": {
+            "alt": "not-web-platform.test"
+        },
+        "doc_root": repo_root,
+        "ws_doc_root": os.path.join(repo_root, "websockets", "handlers"),
+        "server_host": None,
+        "ports": {
+            "http": [8000, "auto"],
+            "https": [8443],
+            "ws": ["auto"],
+            "wss": ["auto"]
+        },
+        "check_subdomains": True,
+        "log_level": "debug",
+        "bind_address": True,
+        "ssl": {
+            "type": "pregenerated",
+            "encrypt_after_connect": False,
+            "openssl": {
+                "openssl_binary": "openssl",
+                "base_path": "_certs",
+                "force_regenerate": False,
+                "base_conf_path": None
+            },
+            "pregenerated": {
+                "host_key_path": os.path.join(repo_root, "tools", "certs", "web-platform.test.key"),
+                "host_cert_path": os.path.join(repo_root, "tools", "certs", "web-platform.test.pem")
+            },
+            "none": {}
+        },
+        "aliases": []
+    }
+
     def __init__(self, *args, **kwargs):
         super(Config, self).__init__(
             subdomains=_subdomains,
@@ -590,6 +706,23 @@ class Config(config.Config):
             *args,
             **kwargs
         )
+
+    @property
+    def ws_doc_root(self):
+        if self._ws_doc_root is not None:
+            return self._ws_doc_root
+        else:
+            return os.path.join(self.doc_root, "websockets", "handlers")
+
+    @ws_doc_root.setter
+    def ws_doc_root(self, v):
+        self._ws_doc_root = v
+
+    @property
+    def paths(self):
+        rv = super(Config, self).paths
+        rv["ws_doc_root"] = self.ws_doc_root
+        return rv
 
 
 def get_parser():
@@ -606,8 +739,7 @@ def get_parser():
 
 
 def run(**kwargs):
-    config = load_config(os.path.join(repo_root, "config.default.json"),
-                         os.path.join(repo_root, "config.json"),
+    config = load_config(os.path.join(repo_root, "config.json"),
                          **kwargs)
 
     global logger
@@ -617,9 +749,7 @@ def run(**kwargs):
     bind_address = config["bind_address"]
 
     if config["check_subdomains"]:
-        paths = config.paths
-        ssl_config = config.ssl_config
-        check_subdomains(config.domains, paths, bind_address, ssl_config, config["aliases"])
+        check_subdomains(config)
 
     stash_address = None
     if bind_address:
